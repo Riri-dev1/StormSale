@@ -221,15 +221,32 @@ export function validateCspHeader(header: string): { isValid: boolean; errors: s
     errors.push("CSP header contains prohibited 'unsafe-eval'");
   }
 
-  if (!header.includes("default-src 'self'")) {
+  // Parse directives into scoped key -> source tokens mapping
+  const directives: Record<string, string[]> = {};
+  header
+    .split(";")
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .forEach((part) => {
+      const tokens = part.split(/\s+/);
+      const name = tokens[0];
+      const values = tokens.slice(1);
+      directives[name] = values;
+    });
+
+  if (!directives["default-src"] || !directives["default-src"].includes("'self'")) {
     errors.push("Missing required 'default-src 'self'' directive");
   }
 
-  if (!header.includes("script-src") || !header.includes("'self'")) {
+  if (!directives["script-src"] || !directives["script-src"].includes("'self'")) {
     errors.push("Missing required 'script-src' directive with ''self''");
   }
 
-  if (!header.includes("connect-src") || !header.includes("https://*.stellar.org")) {
+  if (
+    !directives["connect-src"] ||
+    !directives["connect-src"].includes("'self'") ||
+    !directives["connect-src"].includes("https://*.stellar.org")
+  ) {
     errors.push("Missing required 'connect-src' with 'https://*.stellar.org'");
   }
 
