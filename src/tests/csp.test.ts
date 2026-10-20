@@ -14,6 +14,54 @@ import nginxContent from "../../nginx.conf?raw";
 import viteContent from "../../vite.config.ts?raw";
 import indexHtmlContent from "../../index.html?raw";
 
+// Polyfill minimal DOMParser for Node.js test environment if not globally present
+if (typeof DOMParser === "undefined") {
+  (globalThis as unknown as { DOMParser: unknown }).DOMParser = class DOMParser {
+    parseFromString(html: string, _type: string = "text/html") {
+      const getElements = (tagName: string) => {
+        const matches = [...html.matchAll(new RegExp(`<${tagName}\\b([^>]*)>`, "gi"))];
+        return matches.map((m) => {
+          const attrText = m[1];
+          const attrs: Record<string, string> = {};
+          const attrMatches = [
+            ...attrText.matchAll(/([a-zA-Z0-9_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g),
+          ];
+          for (const am of attrMatches) {
+            const name = am[1].toLowerCase();
+            const val = am[2] ?? am[3] ?? am[4] ?? "";
+            attrs[name] = val;
+          }
+          return {
+            tagName: tagName.toUpperCase(),
+            getAttribute: (attr: string) =>
+              attr.toLowerCase() in attrs ? attrs[attr.toLowerCase()] : null,
+            hasAttribute: (attr: string) => attr.toLowerCase() in attrs,
+          };
+        });
+      };
+
+      return {
+        querySelectorAll: (selector: string) => {
+          if (selector === "script[src]" || selector === "script") {
+            const scripts = getElements("script");
+            return selector === "script[src]"
+              ? scripts.filter((s) => s.getAttribute("src") !== null)
+              : scripts;
+          }
+          if (selector === "link[rel='stylesheet']" || selector === "link") {
+            const links = getElements("link");
+            return selector.includes("stylesheet")
+              ? links.filter((l) => (l.getAttribute("rel") || "").toLowerCase() === "stylesheet")
+              : links;
+          }
+          return [];
+        },
+        getElementsByTagName: (tagName: string) => getElements(tagName),
+      };
+    }
+  };
+}
+
 describe("Content Security Policy (CSP) & Subresource Integrity (SRI) Suite - Issue #211", () => {
   describe("1. Required Directives Presence & Exact Header Parity", () => {
     it("verifies base CSP directives are correctly defined and present", () => {
@@ -37,6 +85,22 @@ describe("Content Security Policy (CSP) & Subresource Integrity (SRI) Suite - Is
       const validation = validateCspHeader(STATIC_CSP_HEADER);
       expect(validation.isValid).toBe(true);
       expect(validation.errors).toHaveLength(0);
+    });
+
+    it("verifies validateCspHeader scopes checks to specific directives", () => {
+      // Header has 'self' in default-src, but script-src has no 'self'
+      const invalidScriptSrc =
+        "default-src 'self'; script-src https://example.com; connect-src 'self' https://*.stellar.org;";
+      const res1 = validateCspHeader(invalidScriptSrc);
+      expect(res1.isValid).toBe(false);
+      expect(res1.errors).toContain("Missing required 'script-src' directive with ''self''");
+
+      // Header has https://*.stellar.org in img-src, but connect-src lacks it
+      const invalidConnectSrc =
+        "default-src 'self'; script-src 'self'; connect-src 'self'; img-src https://*.stellar.org;";
+      const res2 = validateCspHeader(invalidConnectSrc);
+      expect(res2.isValid).toBe(false);
+      expect(res2.errors).toContain("Missing required 'connect-src' with 'https://*.stellar.org'");
     });
 
     it("verifies vercel.json exactly matches STATIC_CSP_HEADER", () => {
@@ -181,37 +245,55 @@ describe("Content Security Policy (CSP) & Subresource Integrity (SRI) Suite - Is
     });
 
     it("verifies external scripts in index.html possess valid Subresource Integrity hashes and crossorigin", () => {
-      // Find all external <script> tags with src="https://..."
-      const scriptRegex = /<script\b([^>]*)src=["'](https?:\/\/[^"']+)["']([^>]*)>/gi;
-      let match: RegExpExecArray | null;
-      let externalScriptCount = 0;
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(indexHtmlContent, "text/html");
+      const scripts = Array.from(doc.querySelectorAll("script[src]"));
 
-      while ((match = scriptRegex.exec(indexHtmlContent)) !== null) {
-        externalScriptCount++;
-        const fullTag = match[0];
-        const srcUrl = match[2];
+      const externalScripts = scripts.filter((s) => {
+        const src = s.getAttribute("src") || "";
+        return src.startsWith("http://") || src.startsWith("https://");
+      });
 
-        // Ensure every external script tag includes an integrity attribute
-        expect(fullTag).toContain('integrity="sha384-');
-        // Ensure integrity hash is valid sha384 base64 format (48 bytes base64-encoded = 64 chars)
-        const integrityMatch = fullTag.match(/integrity=["'](sha384-[A-Za-z0-9+/=]{64})["']/);
-        expect(integrityMatch).not.toBeNull();
+      expect(externalScripts.length).toBeGreaterThanOrEqual(1);
 
-        // Ensure crossorigin attribute is present
-        expect(fullTag).toContain('crossorigin="anonymous"');
+      for (const script of externalScripts) {
+        const src = script.getAttribute("src");
+        const integrity = script.getAttribute("integrity");
+        const crossorigin = script.getAttribute("crossorigin");
 
-        // Documented domain
-        expect(srcUrl).toContain("https://telegram.org");
+        expect(src).toBeTruthy();
+        expect(src).toContain("https://telegram.org");
+
+        // Validate sha384 algorithm with a 64-character Base64 digest
+        expect(integrity).toBeTruthy();
+        expect(integrity).toMatch(/^sha384-[A-Za-z0-9+/=]{64}$/);
+
+        // Require anonymous crossorigin
+        expect(crossorigin).toBe("anonymous");
       }
-
-      // Assert at least one external script was audited
-      expect(externalScriptCount).toBeGreaterThanOrEqual(1);
     });
 
-    it("verifies no external stylesheets lack integrity attributes in index.html", () => {
-      expect(indexHtmlContent).not.toMatch(
-        /<link[^>]+rel=["']stylesheet["'][^>]+href=["']https?:\/\/(?!.*integrity=)/i,
-      );
+    it("verifies external stylesheets in index.html possess valid Subresource Integrity hashes", () => {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(indexHtmlContent, "text/html");
+      const links = Array.from(doc.querySelectorAll("link[rel='stylesheet']"));
+
+      const externalStylesheets = links.filter((l) => {
+        const href = l.getAttribute("href") || "";
+        return href.startsWith("http://") || href.startsWith("https://");
+      });
+
+      for (const link of externalStylesheets) {
+        const integrity = link.getAttribute("integrity");
+        const crossorigin = link.getAttribute("crossorigin");
+
+        expect(integrity).toBeTruthy();
+        expect(integrity).toMatch(/^sha384-[A-Za-z0-9+/=]{64}$/);
+        expect(crossorigin).toBe("anonymous");
+      }
+
+      // In StormSale, all stylesheets are bundled locally (no external stylesheet links)
+      expect(externalStylesheets.length).toBe(0);
     });
   });
 });
